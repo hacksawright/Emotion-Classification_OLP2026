@@ -103,7 +103,7 @@ def load_merged_split(dataset_root: Path, split: str) -> dict[str, list]:
     elif split == "PublicTest":
         path = dataset_root / f"public_test/{split}.json"
     elif split == "PrivateTest":
-        path = dataset_root / f"{split}.json"
+        path = Path("/kaggle/working/private_test") / f"{split}.json"
     else:
         raise ValueError(f"Invalid split: {split}")
 
