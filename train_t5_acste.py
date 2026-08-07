@@ -239,7 +239,7 @@ def main():
     parser.add_argument("--max_input_length", type=int, default=128)
     parser.add_argument("--max_target_length", type=int, default=128)
     parser.add_argument("--num_train_epochs", type=int, default=5)
-    parser.add_argument("--per_device_train_batch_size", type=int, default=64)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=16)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=64)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
