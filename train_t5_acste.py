@@ -236,11 +236,11 @@ def main():
         help="Chỉ đọc file trên disk (không gọi Hub). Nên dùng cùng --pretrained_local_dir khi thi.",
     )
     parser.add_argument("--output_dir", type=str, default="outputs/t5-acste")
-    parser.add_argument("--max_input_length", type=int, default=512)
-    parser.add_argument("--max_target_length", type=int, default=256)
+    parser.add_argument("--max_input_length", type=int, default=128)
+    parser.add_argument("--max_target_length", type=int, default=128)
     parser.add_argument("--num_train_epochs", type=int, default=5)
-    parser.add_argument("--per_device_train_batch_size", type=int, default=8)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=8)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=64)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=64)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.06)
@@ -507,6 +507,7 @@ def main():
         "fp16": torch.cuda.is_available(),
         "seed": args.seed,
         "report_to": "none",
+        "dataloader_num_workers": 4
     }
     try:
         training_args = Seq2SeqTrainingArguments(eval_strategy="epoch", **train_kw)
