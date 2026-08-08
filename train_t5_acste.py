@@ -94,7 +94,11 @@ def load_split_per_domain(dataset_dir: Path, domain: str, split: str) -> list:
     if not path.exists():
         raise FileNotFoundError(path)
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    for item in data:
+        if isinstance(item, dict):
+            item["domain"] = domain
+    return data
 
 
 def load_merged_split(dataset_root: Path, split: str) -> dict[str, list]:
@@ -118,20 +122,29 @@ def load_merged_split(dataset_root: Path, split: str) -> dict[str, list]:
             raise KeyError(f"Merged file {path} missing domain key: {d}")
         if not isinstance(data[d], list):
             raise ValueError(f"{path}[{d}] must be a list")
+        for item in data[d]:
+            if isinstance(item, dict):
+                item["domain"] = d
     return data
 
 
 def merge_lists_from_merged(blob: dict[str, list], domains: list[str]) -> list:
     out = []
     for d in domains:
-        out.extend(blob[d])
+        for item in blob[d]:
+            item_copy = dict(item)
+            item_copy["domain"] = d
+            out.append(item_copy)
     return out
 
 
 def merge_splits_per_domain(dataset_dir: Path, domains: list[str], split: str) -> list:
     out = []
     for d in domains:
-        out.extend(load_split_per_domain(dataset_dir, d, split))
+        for item in load_split_per_domain(dataset_dir, d, split):
+            item_copy = dict(item)
+            item_copy["domain"] = d
+            out.append(item_copy)
     return out
 
 
@@ -154,7 +167,9 @@ def target_text_from_quadruples(quadruples: list) -> str:
     return TRIPLE_JOIN.join(parts) if parts else EMPTY_TARGET
 
 
-def item_to_input_text(raw_words: str) -> str:
+def item_to_input_text(raw_words: str, domain: str = None) -> str:
+    if domain:
+        return f"acste {domain}: {raw_words}"
     return f"{INPUT_PREFIX}{raw_words}"
 
 
@@ -184,7 +199,7 @@ def parse_generated_triples(text: str) -> list[dict]:
 
 
 def build_records(data: list) -> dict:
-    inputs = [item_to_input_text(x["raw_words"]) for x in data]
+    inputs = [item_to_input_text(x["raw_words"], x.get("domain")) for x in data]
     targets = [target_text_from_quadruples(x["quadruples"]) for x in data]
     return {"input_text": inputs, "target_text": targets}
 
@@ -308,12 +323,20 @@ def main():
         else:
             eval_raw = load_split_per_domain(root, eval_domain, "Dev")
 
+    # Clean training raw data on-the-fly using clean_data.py
+    try:
+        from clean_data import clean_train_raw
+        print("Cleaning training data...")
+        train_raw = clean_train_raw(train_raw, eval_raw)
+    except ImportError:
+        print("WARNING: clean_data.py not found. Training on uncleaned raw data.")
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     def run_generation(model_gen, tok_gen, items: list) -> list[dict]:
         model_gen.eval()
-        inputs_text = [item_to_input_text(x["raw_words"]) for x in items]
+        inputs_text = [item_to_input_text(x["raw_words"], x.get("domain")) for x in items]
         preds_loc: list[str] = []
         bs = args.per_device_eval_batch_size
         for i in range(0, len(inputs_text), bs):
