@@ -50,6 +50,7 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
+    EarlyStoppingCallback,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     set_seed,
@@ -255,6 +256,18 @@ def main():
     parser.add_argument("--max_input_length", type=int, default=128)
     parser.add_argument("--max_target_length", type=int, default=128)
     parser.add_argument("--num_train_epochs", type=int, default=5)
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=2,
+        help="Số lần đánh giá liên tiếp không cải thiện trước khi dừng train.",
+    )
+    parser.add_argument(
+        "--early_stopping_threshold",
+        type=float,
+        default=0.0,
+        help="Mức cải thiện tối thiểu của eval_micro_f1 được xem là tiến bộ.",
+    )
     parser.add_argument("--per_device_train_batch_size", type=int, default=16)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=64)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
@@ -586,6 +599,12 @@ def main():
         processing_class=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        callbacks=[
+            EarlyStoppingCallback(
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_threshold=args.early_stopping_threshold,
+            )
+        ],
     )
 
     trainer.train()
