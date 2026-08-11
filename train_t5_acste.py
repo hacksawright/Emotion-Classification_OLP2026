@@ -44,7 +44,8 @@ import re
 from pathlib import Path
 
 import torch
-from datasets import Dataset
+from merged_splitdatasets import Dataset
+from evaluation_script import compute_micro_f1
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
@@ -490,8 +491,48 @@ def main():
     train_ds = Dataset.from_dict(build_records(train_raw))
     eval_ds = Dataset.from_dict(build_records(eval_raw))
 
+    eval_domain_indices = {}
+    for index, item in enumerate(eval_raw):
+        domain = item.get("domain", eval_domain)
+        eval_domain_indices.setdefault(domain, []).append(index)
+
     tokenizer = AutoTokenizer.from_pretrained(pretrained_src, **pre_kw)
     model = AutoModelForSeq2SeqLM.from_pretrained(pretrained_src, **pre_kw)
+
+    def compute_metrics(eval_pred):
+        predictions, labels = eval_pred
+        if isinstance(predictions, tuple):
+            predictions = predictions[0]
+
+        labels = labels.copy()
+        labels[labels == -100] = tokenizer.pad_token_id
+        pred_texts = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        gold_texts = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        gold_triples = []
+        pred_triples = []
+        for gold_text, pred_text in zip(gold_texts, pred_texts):
+            gold_triples.append(
+                [
+                    (triple["aspect"], triple["category"], triple["sentiment"])
+                    for triple in parse_generated_triples(gold_text)
+                ]
+            )
+            pred_triples.append(
+                [
+                    (triple["aspect"], triple["category"], triple["sentiment"])
+                    for triple in parse_generated_triples(pred_text)
+                ]
+            )
+
+        domain_f1s = []
+        for indices in eval_domain_indices.values():
+            domain_gold = [gold_triples[index] for index in indices]
+            domain_pred = [pred_triples[index] for index in indices]
+            _, _, domain_f1 = compute_micro_f1(domain_gold, domain_pred)
+            domain_f1s.append(domain_f1)
+
+        return {"micro_f1": sum(domain_f1s) / len(domain_f1s) if domain_f1s else 0.0}
 
     def preprocess_fn(batch):
         model_inputs = tokenizer(
@@ -522,11 +563,11 @@ def main():
         "warmup_ratio": args.warmup_ratio,
         "save_strategy": "epoch",
         "load_best_model_at_end": True,
-        "metric_for_best_model": "eval_loss",
-        "greater_is_better": False,
+        "metric_for_best_model": "eval_micro_f1",
+        "greater_is_better": True,
         "save_total_limit": 2,
         "logging_steps": 50,
-        "predict_with_generate": False,
+        "predict_with_generate": True,
         "fp16": torch.cuda.is_available(),
         "seed": args.seed,
         "report_to": "none",
@@ -544,6 +585,7 @@ def main():
         eval_dataset=tokenized_eval,
         processing_class=tokenizer,
         data_collator=data_collator,
+        compute_metrics=compute_metrics,
     )
 
     trainer.train()
@@ -551,7 +593,7 @@ def main():
     best_dir = output_dir / "checkpoint-best"
     trainer.save_model(str(best_dir))
     tokenizer.save_pretrained(str(best_dir))
-    print(f"Đã lưu checkpoint tốt nhất (theo eval_loss) tới {best_dir}")
+    print(f"Đã lưu checkpoint tốt nhất (theo eval_micro_f1) tới {best_dir}")
 
     trainer.model.to(device)
     run_generation_save(trainer.model, tokenizer)
