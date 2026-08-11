@@ -65,6 +65,16 @@ FIELD_SEP = " | "
 EMPTY_TARGET = "<empty>"
 
 
+class TeacherForcingDataCollator(DataCollatorForSeq2Seq):
+    def __call__(self, features, return_tensors=None):
+        batch = super().__call__(features, return_tensors=return_tensors)
+        if "labels" in batch and "decoder_input_ids" not in batch:
+            batch["decoder_input_ids"] = self.model.prepare_decoder_input_ids_from_labels(
+                batch["labels"]
+            )
+        return batch
+
+
 def _env_offline() -> bool:
     return os.environ.get("TRANSFORMERS_OFFLINE", "").lower() in ("1", "true", "yes")
 
@@ -564,7 +574,7 @@ def main():
     tokenized_train = train_ds.map(preprocess_fn, batched=True, remove_columns=train_ds.column_names)
     tokenized_eval = eval_ds.map(preprocess_fn, batched=True, remove_columns=eval_ds.column_names)
 
-    data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
+    data_collator = TeacherForcingDataCollator(tokenizer=tokenizer, model=model)
 
     train_kw = {
         "output_dir": str(output_dir),
