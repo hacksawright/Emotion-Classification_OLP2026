@@ -599,10 +599,25 @@ def main():
     train_ds = Dataset.from_dict(build_records(train_raw))
     eval_ds = Dataset.from_dict(build_records(eval_raw))
 
+    # Chọn CHÍNH XÁC một chế độ precision và load model đúng dtype đó — nếu để model tự load
+    # theo dtype gốc của checkpoint (nhiều model Qwen lưu sẵn ở bfloat16) trong khi
+    # TrainingArguments ép fp16=True, GradScaler của fp16 sẽ cố unscale gradient bfloat16 và lỗi
+    # "_amp_foreach_non_finite_check_and_unscale_cuda not implemented for BFloat16".
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    use_fp16 = torch.cuda.is_available() and not use_bf16
+    if use_bf16:
+        compute_dtype = torch.bfloat16
+    elif use_fp16:
+        compute_dtype = torch.float16
+    else:
+        compute_dtype = torch.float32
+
     tokenizer = AutoTokenizer.from_pretrained(pretrained_src, **pre_kw, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(pretrained_src, **pre_kw, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        pretrained_src, **pre_kw, trust_remote_code=True, torch_dtype=compute_dtype
+    )
     model.config.pad_token_id = tokenizer.pad_token_id
 
     def preprocess_fn(batch):
@@ -626,7 +641,8 @@ def main():
         "greater_is_better": False,
         "save_total_limit": 2,
         "logging_steps": 50,
-        "fp16": torch.cuda.is_available(),
+        "fp16": use_fp16,
+        "bf16": use_bf16,
         "seed": args.seed,
         "report_to": "none",
         "dataloader_num_workers": 4,
