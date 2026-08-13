@@ -48,6 +48,7 @@ from datasets import Dataset
 from evaluation_script import compute_micro_f1
 from transformers import (
     AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
     EarlyStoppingCallback,
@@ -181,7 +182,7 @@ def target_text_from_quadruples(quadruples: list) -> str:
 
 def item_to_input_text(raw_words: str, domain: str = None) -> str:
     if domain:
-        return f"acste {domain}: {raw_words}"
+        return f"Extract triples (aspect | category | sentiment) for {domain}: {raw_words}"
     return f"{INPUT_PREFIX}{raw_words}"
 
 
