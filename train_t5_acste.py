@@ -348,12 +348,12 @@ def main():
             eval_raw = load_split_per_domain(root, eval_domain, "Dev")
 
     # Clean training raw data on-the-fly using clean_data.py
-    try:
-        from clean_data import clean_train_raw
-        print("Cleaning training data...")
-        train_raw = clean_train_raw(train_raw, eval_raw)
-    except ImportError:
-        print("WARNING: clean_data.py not found. Training on uncleaned raw data.")
+    # try:
+    #     from clean_data import clean_train_raw
+    #     print("Cleaning training data...")
+    #     train_raw = clean_train_raw(train_raw, eval_raw)
+    # except ImportError:
+    #     print("WARNING: clean_data.py not found. Training on uncleaned raw data.")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
