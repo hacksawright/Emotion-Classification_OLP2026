@@ -606,7 +606,6 @@ def main():
         "greater_is_better": False,
         "save_total_limit": 2,
         "logging_steps": 50,
-        "predict_with_generate": True,
         "fp16": torch.cuda.is_available(),
         "seed": args.seed,
         "report_to": "none",
