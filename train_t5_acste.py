@@ -47,17 +47,12 @@ import torch
 from datasets import Dataset
 from evaluation_script import compute_micro_f1
 from transformers import (
-    AutoModelForSeq2SeqLM,
     AutoModelForCausalLM,
     AutoTokenizer,
-    DataCollatorForSeq2Seq,
     EarlyStoppingCallback,
-    Seq2SeqTrainer,
-    Seq2SeqTrainingArguments,
     set_seed,
     TrainingArguments,
     Trainer,
-    
 )
 
 # Khớp competition_dataset / evaluation_script (thứ tự key)
@@ -70,8 +65,15 @@ EMPTY_TARGET = "<empty>"
 
 
 def make_causal_lm_batch(batch, tokenizer, max_input_length: int, max_target_length: int):
-    """Tạo batch theo kiểu SFT: prompt là chat template, labels chỉ học phần response."""
-    model_inputs = {}
+    """Tạo batch theo kiểu SFT: prompt là chat template, labels chỉ học phần response.
+
+    Không pad ở đây: mỗi lần gọi .map(batched=True) chỉ thấy một phần của dataset, nên nếu
+    pad cố định theo max_len của riêng lô đó thì các lô khác nhau sẽ ra độ dài khác nhau.
+    Khi Trainer gộp batch để train, nó lấy ngẫu nhiên các sample từ nhiều lô .map khác nhau
+    -> độ dài lệch nhau -> lỗi khi torch.tensor() cố xếp chúng lại (đặc biệt là "labels", vì
+    collator mặc định của Trainer không biết cách pad "labels"). Việc pad thật sự được
+    chuyển sang CausalSFTDataCollator, chạy tại thời điểm tạo batch train.
+    """
     input_ids = []
     labels = []
     for prompt, target in zip(batch["input_text"], batch["target_text"]):
@@ -100,21 +102,34 @@ def make_causal_lm_batch(batch, tokenizer, max_input_length: int, max_target_len
         input_ids.append(combined_ids)
         labels.append(label_ids)
 
-    if not input_ids:
-        return {"input_ids": [], "labels": [], "attention_mask": []}
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": [[1] * len(seq) for seq in input_ids],
+    }
 
-    max_len = max(len(x) for x in input_ids)
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    model_inputs["input_ids"] = [
-        seq + [pad_id] * (max_len - len(seq)) for seq in input_ids
-    ]
-    model_inputs["labels"] = [
-        label + [-100] * (max_len - len(label)) for label in labels
-    ]
-    model_inputs["attention_mask"] = [
-        [1] * len(seq) + [0] * (max_len - len(seq)) for seq in input_ids
-    ]
-    return model_inputs
+
+class CausalSFTDataCollator:
+    """Pad input_ids/attention_mask/labels tới độ dài lớn nhất trong MỖI batch train (dynamic
+    padding), thay vì pad cố định lúc tiền xử lý. Pad "labels" bằng -100 để không tính loss
+    trên phần pad."""
+
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, features: list[dict]) -> dict:
+        max_len = max(len(f["input_ids"]) for f in features)
+        input_ids, labels, attention_mask = [], [], []
+        for f in features:
+            pad_len = max_len - len(f["input_ids"])
+            input_ids.append(f["input_ids"] + [self.pad_token_id] * pad_len)
+            labels.append(f["labels"] + [-100] * pad_len)
+            attention_mask.append(f["attention_mask"] + [0] * pad_len)
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        }
 
 
 def _env_offline() -> bool:
@@ -422,6 +437,8 @@ def main():
 
     def run_generation(model_gen, tok_gen, items: list) -> list[dict]:
         model_gen.eval()
+        prev_padding_side = tok_gen.padding_side
+        tok_gen.padding_side = "left"  # batch generate cần left-padding để cắt đúng phần sinh ra
         prompts = [build_sft_prompt(x["raw_words"], x.get("domain")) for x in items]
         preds_loc: list[str] = []
         bs = args.per_device_eval_batch_size
@@ -435,6 +452,8 @@ def main():
                 truncation=True,
                 max_length=args.max_input_length,
                 return_tensors="pt",
+                return_dict=True,  # thiếu dòng này thì kết quả là Tensor thô, không phải dict
+                                    # -> "**batch_in" ở dưới sẽ lỗi TypeError
             ).to(device)
             with torch.no_grad():
                 gen = model_gen.generate(
@@ -445,6 +464,7 @@ def main():
                 )
             generated = gen[:, batch_in["input_ids"].shape[1] :]
             preds_loc.extend(tok_gen.batch_decode(generated, skip_special_tokens=True))
+        tok_gen.padding_side = prev_padding_side
         return [
             {"raw_words": item["raw_words"], "triples": parse_generated_triples(pred)}
             for item, pred in zip(items, preds_loc)
@@ -622,6 +642,7 @@ def main():
         train_dataset=tokenized_train,
         eval_dataset=tokenized_eval,
         processing_class=tokenizer,
+        data_collator=CausalSFTDataCollator(pad_token_id=tokenizer.pad_token_id),
         callbacks=[
             EarlyStoppingCallback(
                 early_stopping_patience=args.early_stopping_patience,
