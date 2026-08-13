@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Huấn luyện T5 (seq2seq) cho ACSTE trên MEMD-ABSA.
+Huấn luyện Qwen (causal LM) cho ACSTE trên MEMD-ABSA.
 
 Dữ liệu (mặc định — layout merged, thư mục dataset):
   - Train.json, Dev.json: object { "Restaurant": [...], "Laptop": [...], ... }
@@ -66,14 +66,52 @@ FIELD_SEP = " | "
 EMPTY_TARGET = "<empty>"
 
 
-class TeacherForcingDataCollator(DataCollatorForSeq2Seq):
-    def __call__(self, features, return_tensors=None):
-        batch = super().__call__(features, return_tensors=return_tensors)
-        if "labels" in batch and "decoder_input_ids" not in batch:
-            batch["decoder_input_ids"] = self.model.prepare_decoder_input_ids_from_labels(
-                batch["labels"]
-            )
-        return batch
+def make_causal_lm_batch(batch, tokenizer, max_input_length: int, max_target_length: int):
+    """Tạo batch theo kiểu SFT: prompt là chat template, labels chỉ học phần response."""
+    model_inputs = {}
+    input_ids = []
+    labels = []
+    for prompt, target in zip(batch["input_text"], batch["target_text"]):
+        prompt_text = tokenizer.apply_chat_template(
+            prompt,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        prompt_ids = tokenizer(
+            prompt_text,
+            add_special_tokens=False,
+            max_length=max_input_length,
+            truncation=True,
+        )["input_ids"]
+        target_text = target + tokenizer.eos_token
+        target_ids = tokenizer(
+            target_text,
+            add_special_tokens=False,
+            max_length=max_target_length,
+            truncation=True,
+        )["input_ids"]
+        combined_ids = prompt_ids + target_ids
+        label_ids = [-100] * len(prompt_ids) + target_ids
+        if len(combined_ids) > max_input_length + max_target_length:
+            continue
+        input_ids.append(combined_ids)
+        labels.append(label_ids)
+
+    if not input_ids:
+        return {"input_ids": [], "labels": [], "attention_mask": []}
+
+    max_len = max(len(x) for x in input_ids)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    model_inputs["input_ids"] = [
+        seq + [pad_id] * (max_len - len(seq)) for seq in input_ids
+    ]
+    model_inputs["labels"] = [
+        label + [-100] * (max_len - len(label)) for label in labels
+    ]
+    model_inputs["attention_mask"] = [
+        [1] * len(seq) + [0] * (max_len - len(seq)) for seq in input_ids
+    ]
+    return model_inputs
 
 
 def _env_offline() -> bool:
@@ -186,6 +224,30 @@ def item_to_input_text(raw_words: str, domain: str = None) -> str:
     return f"{INPUT_PREFIX}{raw_words}"
 
 
+def build_sft_prompt(raw_words: str, domain: str = None) -> list[dict]:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an ACSTE extraction system. Extract aspect-category-sentiment triples "
+                "in the required output format."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Extract all triples for the {domain} domain.\n\n"
+                f"Text:\n{raw_words}\n\n"
+                "Output format:\naspect | category | sentiment\n\n"
+                "Output only the triples."
+                if domain
+                else f"Extract all triples.\n\nText:\n{raw_words}\n\nOutput format:\naspect | category | sentiment\n\nOutput only the triples."
+            ),
+        },
+    ]
+    return messages
+
+
 def parse_generated_triples(text: str) -> list[dict]:
     if text is None:
         return []
@@ -212,8 +274,12 @@ def parse_generated_triples(text: str) -> list[dict]:
 
 
 def build_records(data: list) -> dict:
-    inputs = [item_to_input_text(x["raw_words"], x.get("domain")) for x in data]
-    targets = [target_text_from_quadruples(x["quadruples"]) for x in data]
+    inputs = []
+    targets = []
+    for x in data:
+        prompt = build_sft_prompt(x["raw_words"], x.get("domain"))
+        inputs.append(prompt)
+        targets.append(target_text_from_quadruples(x["quadruples"]))
     return {"input_text": inputs, "target_text": targets}
 
 
@@ -348,39 +414,34 @@ def main():
         else:
             eval_raw = load_split_per_domain(root, eval_domain, "Dev")
 
-    # Clean training raw data on-the-fly using clean_data.py
-    # try:
-    #     from clean_data import clean_train_raw
-    #     print("Cleaning training data...")
-    #     train_raw = clean_train_raw(train_raw, eval_raw)
-    # except ImportError:
-    #     print("WARNING: clean_data.py not found. Training on uncleaned raw data.")
-
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     def run_generation(model_gen, tok_gen, items: list) -> list[dict]:
         model_gen.eval()
-        inputs_text = [item_to_input_text(x["raw_words"], x.get("domain")) for x in items]
+        prompts = [build_sft_prompt(x["raw_words"], x.get("domain")) for x in items]
         preds_loc: list[str] = []
         bs = args.per_device_eval_batch_size
-        for i in range(0, len(inputs_text), bs):
-            batch_in = inputs_text[i : i + bs]
-            enc = tok_gen(
-                batch_in,
-                return_tensors="pt",
+        for i in range(0, len(prompts), bs):
+            batch_prompts = prompts[i : i + bs]
+            batch_in = tok_gen.apply_chat_template(
+                batch_prompts,
+                tokenize=True,
+                add_generation_prompt=True,
                 padding=True,
                 truncation=True,
                 max_length=args.max_input_length,
+                return_tensors="pt",
             ).to(device)
             with torch.no_grad():
                 gen = model_gen.generate(
-                    **enc,
+                    **batch_in,
                     max_new_tokens=args.max_target_length,
                     num_beams=args.generation_num_beams,
                     early_stopping=True,
                 )
-            preds_loc.extend(tok_gen.batch_decode(gen, skip_special_tokens=True))
+            generated = gen[:, batch_in["input_ids"].shape[1] :]
+            preds_loc.extend(tok_gen.batch_decode(generated, skip_special_tokens=True))
         return [
             {"raw_words": item["raw_words"], "triples": parse_generated_triples(pred)}
             for item, pred in zip(items, preds_loc)
@@ -507,7 +568,7 @@ def main():
             tokenizer_po = AutoTokenizer.from_pretrained(str(ckpt_dir), **pre_kw)
         else:
             tokenizer_po = AutoTokenizer.from_pretrained(pretrained_src, **pre_kw)
-        model_po = AutoModelForSeq2SeqLM.from_pretrained(str(ckpt_dir), **pre_kw)
+        model_po = AutoModelForCausalLM.from_pretrained(str(ckpt_dir), **pre_kw)
         model_po.to(device)
         run_generation_save(model_po, tokenizer_po)
         return
@@ -515,67 +576,18 @@ def main():
     train_ds = Dataset.from_dict(build_records(train_raw))
     eval_ds = Dataset.from_dict(build_records(eval_raw))
 
-    eval_domain_indices = {}
-    for index, item in enumerate(eval_raw):
-        domain = item.get("domain", eval_domain)
-        eval_domain_indices.setdefault(domain, []).append(index)
-
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_src, **pre_kw)
-    model = AutoModelForSeq2SeqLM.from_pretrained(pretrained_src, **pre_kw)
-
-    def compute_metrics(eval_pred):
-        predictions, labels = eval_pred
-        if isinstance(predictions, tuple):
-            predictions = predictions[0]
-
-        labels = labels.copy()
-        labels[labels == -100] = tokenizer.pad_token_id
-        pred_texts = tokenizer.batch_decode(predictions, skip_special_tokens=True)
-        gold_texts = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-        gold_triples = []
-        pred_triples = []
-        for gold_text, pred_text in zip(gold_texts, pred_texts):
-            gold_triples.append(
-                [
-                    (triple["aspect"], triple["category"], triple["sentiment"])
-                    for triple in parse_generated_triples(gold_text)
-                ]
-            )
-            pred_triples.append(
-                [
-                    (triple["aspect"], triple["category"], triple["sentiment"])
-                    for triple in parse_generated_triples(pred_text)
-                ]
-            )
-
-        domain_f1s = []
-        for indices in eval_domain_indices.values():
-            domain_gold = [gold_triples[index] for index in indices]
-            domain_pred = [pred_triples[index] for index in indices]
-            _, _, domain_f1 = compute_micro_f1(domain_gold, domain_pred)
-            domain_f1s.append(domain_f1)
-
-        return {"micro_f1": sum(domain_f1s) / len(domain_f1s) if domain_f1s else 0.0}
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_src, **pre_kw, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(pretrained_src, **pre_kw, trust_remote_code=True)
+    model.config.pad_token_id = tokenizer.pad_token_id
 
     def preprocess_fn(batch):
-        model_inputs = tokenizer(
-            batch["input_text"],
-            max_length=args.max_input_length,
-            truncation=True,
-        )
-        labels = tokenizer(
-            text_target=batch["target_text"],
-            max_length=args.max_target_length,
-            truncation=True,
-        )
-        model_inputs["labels"] = labels["input_ids"]
+        model_inputs = make_causal_lm_batch(batch, tokenizer, args.max_input_length, args.max_target_length)
         return model_inputs
 
     tokenized_train = train_ds.map(preprocess_fn, batched=True, remove_columns=train_ds.column_names)
     tokenized_eval = eval_ds.map(preprocess_fn, batched=True, remove_columns=eval_ds.column_names)
-
-    data_collator = TeacherForcingDataCollator(tokenizer=tokenizer, model=model)
 
     train_kw = {
         "output_dir": str(output_dir),
@@ -587,29 +599,27 @@ def main():
         "warmup_ratio": args.warmup_ratio,
         "save_strategy": "epoch",
         "load_best_model_at_end": True,
-        "metric_for_best_model": "eval_micro_f1",
-        "greater_is_better": True,
+        "metric_for_best_model": "eval_loss",
+        "greater_is_better": False,
         "save_total_limit": 2,
         "logging_steps": 50,
         "predict_with_generate": True,
         "fp16": torch.cuda.is_available(),
         "seed": args.seed,
         "report_to": "none",
-        "dataloader_num_workers": 4
+        "dataloader_num_workers": 4,
     }
     try:
-        training_args = Seq2SeqTrainingArguments(eval_strategy="epoch", **train_kw)
+        training_args = TrainingArguments(eval_strategy="epoch", **train_kw)
     except TypeError:
-        training_args = Seq2SeqTrainingArguments(evaluation_strategy="epoch", **train_kw)
+        training_args = TrainingArguments(evaluation_strategy="epoch", **train_kw)
 
-    trainer = Seq2SeqTrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_train,
         eval_dataset=tokenized_eval,
         processing_class=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
         callbacks=[
             EarlyStoppingCallback(
                 early_stopping_patience=args.early_stopping_patience,
@@ -623,7 +633,7 @@ def main():
     best_dir = output_dir / "checkpoint-best"
     trainer.save_model(str(best_dir))
     tokenizer.save_pretrained(str(best_dir))
-    print(f"Đã lưu checkpoint tốt nhất (theo eval_micro_f1) tới {best_dir}")
+    print(f"Đã lưu checkpoint tốt nhất (theo eval_loss) tới {best_dir}")
 
     trainer.model.to(device)
     run_generation_save(trainer.model, tokenizer)
