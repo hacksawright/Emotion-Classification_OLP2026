@@ -55,6 +55,9 @@ from transformers import (
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     set_seed,
+    TrainingArguments,
+    Trainer,
+    
 )
 
 # Khớp competition_dataset / evaluation_script (thứ tự key)
