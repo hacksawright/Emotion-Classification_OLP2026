@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Huấn luyện Qwen (causal LM) cho ACSTE trên MEMD-ABSA.
+Huấn luyện Qwen (causal LM) cho ACSTE trên MEMD-ABSA bằng SFT + LoRA/PEFT.
 
 Dữ liệu (mặc định — layout merged, thư mục dataset):
   - Train.json, Dev.json: object { "Restaurant": [...], "Laptop": [...], ... }
@@ -17,14 +17,14 @@ Ví dụ:
     --train_all_domains \\
     --domain all \\
     --predict_split PublicTest \\
-    --output_dir outputs/t5-baseline
+    --output_dir outputs/qwen-lora
 
 Nếu chỉ predict sử dụng mô hình đã train thì sử dụng flag --predict_only:
 
   python train_t5_acste.py --predict_only --dataset /home/data/TACVU1/ \\
     --domain Restaurant \\
     --dataset_layout merged --predict_split PrivateTest \\
-    --output_dir outputs/t5-baseline --checkpoint_path outputs/t5-baseline/checkpoint-best
+    --output_dir outputs/qwen-lora --checkpoint_path outputs/qwen-lora/checkpoint-best
 
 Một model / một domain (merged): không dùng --train_all_domains, --domain Restaurant|Laptop|...
   Mỗi run tạo output_dir/PublicTest/<Domain>.json và .../PrivateTest/<Domain>.json (mảng).
@@ -46,6 +46,7 @@ from pathlib import Path
 import torch
 from datasets import Dataset
 from evaluation_script import compute_micro_f1
+from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -302,7 +303,7 @@ def build_records(data: list) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train T5 for ACSTE (merged or per-domain dataset)")
+    parser = argparse.ArgumentParser(description="Train Qwen ACSTE with SFT + LoRA (merged or per-domain dataset)")
     parser.add_argument(
         "--dataset",
         type=str,
@@ -365,6 +366,12 @@ def main():
     )
     parser.add_argument("--per_device_train_batch_size", type=int, default=8)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=16)
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Tích lũy gradient. Với LoRA thường có thể giữ 1 nếu VRAM đủ.",
+    )
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.06)
@@ -390,6 +397,22 @@ def main():
         help="PublicTest / PrivateTest / both (2 file).",
     )
     parser.add_argument("--generation_num_beams", type=int, default=4)
+
+    # LoRA / PEFT
+    parser.add_argument(
+        "--use_lora",
+        action="store_true",
+        help="Bật LoRA. Nên dùng trong cuộc thi nếu thư viện peft đã được BTC cài sẵn/cho phép.",
+    )
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,v_proj",
+        help="Danh sách module LoRA, phân cách bằng dấu phẩy. Qwen thường dùng q_proj,v_proj.",
+    )
     args = parser.parse_args()
 
     local_only = args.local_files_only or _env_offline()
@@ -591,8 +614,46 @@ def main():
             tokenizer_po = AutoTokenizer.from_pretrained(str(ckpt_dir), **pre_kw)
         else:
             tokenizer_po = AutoTokenizer.from_pretrained(pretrained_src, **pre_kw)
-        model_po = AutoModelForCausalLM.from_pretrained(str(ckpt_dir), **pre_kw)
-        model_po.to(device)
+
+        # LoRA checkpoint chỉ chứa adapter, nên phải load base model trước rồi gắn adapter.
+        use_lora_checkpoint = args.use_lora or (ckpt_dir / "adapter_config.json").exists()
+
+        if use_lora_checkpoint:
+            if not (ckpt_dir / "adapter_config.json").exists():
+                raise FileNotFoundError(
+                    f"Đang dùng LoRA nhưng không tìm thấy adapter_config.json trong {ckpt_dir}"
+                )
+
+            use_bf16_po = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            use_fp16_po = torch.cuda.is_available() and not use_bf16_po
+            if use_bf16_po:
+                dtype_po = torch.bfloat16
+            elif use_fp16_po:
+                dtype_po = torch.float16
+            else:
+                dtype_po = torch.float32
+
+            base_model_po = AutoModelForCausalLM.from_pretrained(
+                pretrained_src,
+                **pre_kw,
+                trust_remote_code=True,
+                torch_dtype=dtype_po,
+            )
+            model_po = PeftModel.from_pretrained(
+                base_model_po,
+                str(ckpt_dir),
+                is_trainable=False,
+            )
+            model_po.to(device)
+        else:
+            # Backward-compatible: checkpoint full model cũ vẫn có thể predict.
+            model_po = AutoModelForCausalLM.from_pretrained(
+                str(ckpt_dir),
+                **pre_kw,
+                trust_remote_code=True,
+            )
+            model_po.to(device)
+
         run_generation_save(model_po, tokenizer_po)
         return
 
@@ -620,6 +681,36 @@ def main():
     )
     model.config.pad_token_id = tokenizer.pad_token_id
 
+    # ------------------------------------------------------------
+    # LoRA / PEFT
+    # ------------------------------------------------------------
+    if args.use_lora:
+        target_modules = [
+            x.strip()
+            for x in args.lora_target_modules.split(",")
+            if x.strip()
+        ]
+        if not target_modules:
+            raise ValueError("--lora_target_modules không được rỗng.")
+
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+
+        # Không cần train toàn bộ base model; chỉ adapter LoRA có requires_grad=True.
+        # Dùng cache=False khi training causal LM để tránh xung đột với gradient.
+        model.config.use_cache = False
+    else:
+        print("LoRA: OFF -> đang full fine-tuning base model.")
+
     def preprocess_fn(batch):
         model_inputs = make_causal_lm_batch(batch, tokenizer, args.max_input_length, args.max_target_length)
         return model_inputs
@@ -632,6 +723,7 @@ def main():
         "num_train_epochs": args.num_train_epochs,
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "per_device_eval_batch_size": args.per_device_eval_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "warmup_ratio": args.warmup_ratio,
@@ -672,7 +764,13 @@ def main():
     best_dir = output_dir / "checkpoint-best"
     trainer.save_model(str(best_dir))
     tokenizer.save_pretrained(str(best_dir))
-    print(f"Đã lưu checkpoint tốt nhất (theo eval_loss) tới {best_dir}")
+
+    if args.use_lora:
+        print(f"Đã lưu LoRA adapter tốt nhất (theo eval_loss) tới {best_dir}")
+        print("Lưu ý: checkpoint-best là adapter LoRA, không chứa toàn bộ base model.")
+        print(f"Khi predict cần --pretrained_local_dir {pretrained_src} và --checkpoint_path {best_dir}")
+    else:
+        print(f"Đã lưu checkpoint tốt nhất (theo eval_loss) tới {best_dir}")
 
     trainer.model.to(device)
     run_generation_save(trainer.model, tokenizer)
